@@ -88,6 +88,7 @@ def first_name(user) -> str:
 
 @app.on_message(filters.command("start"))
 async def start_handler(_: Client, message: Message) -> None:
+    logger.info("Received /start from user %s", getattr(message.from_user, "id", "unknown"))
     text = (
         f"HELLO, {first_name(message.from_user)}!\n\n"
         "🤖 WELCOME TO AUTO REQUEST ACCEPT BOT!\n\n"
@@ -95,7 +96,10 @@ async def start_handler(_: Client, message: Message) -> None:
         "JUST ADD THIS BOT IN YOUR GROUP OR CHANNEL\n"
         "AND MAKE IT ADMIN WITH FULL RIGHTS."
     )
-    await message.reply_text(text, reply_markup=welcome_buttons())
+    try:
+        await message.reply_text(text, reply_markup=welcome_buttons())
+    except RPCError:
+        logger.exception("Could not reply to /start")
 
 
 @app.on_message(filters.command(["help", "what"]))
