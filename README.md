@@ -11,8 +11,6 @@ python bot.py
 
 Required environment variables:
 
-- `TELEGRAM_API_ID`
-- `TELEGRAM_API_HASH`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_ADMIN_ID`
 
@@ -31,6 +29,6 @@ Use the same command on both platforms:
 python bot.py
 ```
 
-Keep the four required values in environment variables or secrets. MongoDB is not required by this version.
+Keep the two required values in environment variables or secrets. MongoDB is not required by this version.
 
 The web endpoint is available at `/health` and returns a small JSON status response.
