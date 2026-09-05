@@ -1,0 +1,1 @@
+- [Telegram message typography](telegram-message-typography.md) — Telegram clients control bot message fonts; match formatting and layout, not arbitrary font files.

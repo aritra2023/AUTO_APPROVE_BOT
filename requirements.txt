@@ -1,0 +1,6 @@
+aiohttp>=3.9,<4
+Pyrogram>=2,<3
+TgCrypto>=1.2
+aiohttp
+pyrogram
+tgcrypto
