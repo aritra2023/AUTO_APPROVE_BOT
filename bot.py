@@ -15,6 +15,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ChatJoinRequestHandler,
     CommandHandler,
+    ConversationHandler,
     ContextTypes,
 )
 
@@ -42,10 +43,11 @@ PORT = int(os.getenv("PORT", "8080"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "bot_state.json"))
 
 bot_username = ""
+CAST_PIN, CAST_CONFIRM = range(2)
 
 SMALL_CAPS = str.maketrans(
     "abcdefghijklmnopqrstuvwxyz",
-    "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀsᴛᴜᴠᴡxʏᴢ",
+    "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀꜱᴛᴜᴠᴡxʏᴢ",
 )
 
 
@@ -178,11 +180,11 @@ async def help_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     text = (
-        "What can this bot do?\n\n"
-        "This Bot can Approve Join Request Automatically.\n\n"
-        "Just add bot as Administrator in your channels/groups and it's done ✅"
+        f"<b>{small_caps('What Can This Bot Do?')}</b>\n\n"
+        f"<b>{small_caps('This Bot Can Approve Join Request Automatically.')}</b>\n\n"
+        f"<b>{small_caps('Just Add Bot As Administrator In Your Channels Or Groups And It Is Done')} ✅</b>"
     )
-    await message.reply_text(text)
+    await message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def status_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -203,46 +205,157 @@ async def stats_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await message.reply_text(
-        "<b>📊 BOT STATS</b>\n\n"
-        f"<b>Users: {len(state['users'])}</b>\n"
-        f"<b>Approved Requests: {state['approved']}</b>\n"
-        f"<b>Broadcasts: {state['casts']}</b>",
+        f"<b>📊 {small_caps('Bot Stats')}</b>\n\n"
+        f"<b>{small_caps('Users')}: {len(state['users'])}</b>\n"
+        f"<b>{small_caps('Approved Requests')}: {state['approved']}</b>\n"
+        f"<b>{small_caps('Broadcasts')}: {state['casts']}</b>",
         parse_mode=ParseMode.HTML,
     )
 
 
-async def cast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cast_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
     message = update.effective_message
     if message is None or not is_admin(update):
-        return
+        return ConversationHandler.END
 
     source = message.reply_to_message
     if source is None:
         await message.reply_text(
-            "<b>Reply to any text, photo, video or document and send /cast.</b>",
+            f"<b>{small_caps('Reply To Any Text, Photo, Video, Document Or Button Message And Send /cast.')}</b>",
             parse_mode=ParseMode.HTML,
         )
-        return
+        return ConversationHandler.END
+
+    context.user_data["cast_source_chat_id"] = source.chat_id
+    context.user_data["cast_source_message_id"] = source.message_id
+    pin_buttons = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ " + small_caps("Yes, Pin It"), callback_data="cast_pin_yes"
+                ),
+                InlineKeyboardButton(
+                    "❌ " + small_caps("No"), callback_data="cast_pin_no"
+                ),
+            ]
+        ]
+    )
+    await message.reply_text(
+        f"<b>{small_caps('Do You Want To Pin This Broadcast?')}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=pin_buttons,
+    )
+    return CAST_PIN
+
+
+async def cast_pin_choice(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    callback = update.callback_query
+    if callback is None:
+        return ConversationHandler.END
+
+    await callback.answer()
+    context.user_data["cast_pin"] = callback.data == "cast_pin_yes"
+    confirm_buttons = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ " + small_caps("Confirm Cast"), callback_data="cast_confirm_yes"
+                ),
+                InlineKeyboardButton(
+                    "❌ " + small_caps("Cancel"), callback_data="cast_confirm_no"
+                ),
+            ]
+        ]
+    )
+    await callback.edit_message_text(
+        f"<b>{small_caps('Confirm Cast To All Users?')}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=confirm_buttons,
+    )
+    return CAST_CONFIRM
+
+
+async def cast_confirm(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    callback = update.callback_query
+    if callback is None:
+        return ConversationHandler.END
+
+    await callback.answer()
+    if callback.data == "cast_confirm_no":
+        context.user_data.clear()
+        await callback.edit_message_text(
+            f"<b>{small_caps('Cast Cancelled')}.</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
+
+    source_chat_id = context.user_data.pop("cast_source_chat_id", None)
+    source_message_id = context.user_data.pop("cast_source_message_id", None)
+    should_pin = context.user_data.pop("cast_pin", False)
+    if source_chat_id is None or source_message_id is None:
+        await callback.edit_message_text(
+            f"<b>{small_caps('Cast Source Expired. Please Try Again')}.</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return ConversationHandler.END
 
     sent = 0
     failed = 0
+    pin_failed = 0
     for user_id in list(state["users"]):
         try:
-            await context.bot.copy_message(
+            copied = await context.bot.copy_message(
                 chat_id=user_id,
-                from_chat_id=source.chat_id,
-                message_id=source.message_id,
+                from_chat_id=source_chat_id,
+                message_id=source_message_id,
+                reply_markup=source.reply_markup,
             )
             sent += 1
+            if should_pin:
+                try:
+                    await context.bot.pin_chat_message(
+                        chat_id=user_id,
+                        message_id=copied.message_id,
+                        disable_notification=True,
+                    )
+                except TelegramError:
+                    pin_failed += 1
         except TelegramError:
             failed += 1
 
     state["casts"] += 1
     save_state()
-    await message.reply_text(
-        f"<b>CAST COMPLETE\n\nSent: {sent}\nFailed: {failed}</b>",
+    result = (
+        f"<b>{small_caps('Cast Complete')}\n\n"
+        f"{small_caps('Sent')}: {sent}\n"
+        f"{small_caps('Failed')}: {failed}</b>"
+    )
+    if should_pin:
+        result += f"\n<b>{small_caps('Pin Failed')}: {pin_failed}</b>"
+    await callback.edit_message_text(
+        result,
         parse_mode=ParseMode.HTML,
     )
+    return ConversationHandler.END
+
+
+async def cast_cancel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    context.user_data.clear()
+    message = update.effective_message
+    if message is not None:
+        await message.reply_text(
+            f"<b>{small_caps('Cast Cancelled')}.</b>",
+            parse_mode=ParseMode.HTML,
+        )
+    return ConversationHandler.END
 
 
 async def callback_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -319,7 +432,22 @@ def create_application() -> Application:
     application.add_handler(CommandHandler(["help", "what"], help_handler))
     application.add_handler(CommandHandler("status", status_handler))
     application.add_handler(CommandHandler("stats", stats_handler))
-    application.add_handler(CommandHandler("cast", cast_handler))
+    application.add_handler(
+        ConversationHandler(
+            entry_points=[CommandHandler("cast", cast_handler)],
+            states={
+                CAST_PIN: [
+                    CallbackQueryHandler(cast_pin_choice, pattern="^cast_pin_")
+                ],
+                CAST_CONFIRM: [
+                    CallbackQueryHandler(cast_confirm, pattern="^cast_confirm_")
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", cast_cancel)],
+            per_user=True,
+            per_chat=True,
+        )
+    )
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(ChatJoinRequestHandler(join_request_handler))
     return application
