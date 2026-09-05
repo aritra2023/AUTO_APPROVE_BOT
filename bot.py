@@ -379,6 +379,7 @@ async def join_request_handler(
 
     chat_title = request.chat.title or "YOUR CHANNEL OR GROUP"
     user_id = request.from_user.id
+    delivery_chat_id = request.user_chat_id
 
     try:
         await context.bot.approve_chat_join_request(request.chat.id, user_id)
@@ -402,13 +403,13 @@ async def join_request_handler(
     )
     try:
         await context.bot.send_message(
-            user_id,
+            delivery_chat_id,
             text,
             parse_mode=ParseMode.HTML,
             reply_markup=accepted_buttons(getattr(request.chat, "username", None)),
         )
     except TelegramError:
-        logger.info("Could not send welcome message to %s", user_id)
+        logger.exception("Could not send welcome message to join-request chat")
 
 
 async def health(_: web.Request) -> web.Response:
