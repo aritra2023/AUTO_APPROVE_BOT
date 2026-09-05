@@ -466,11 +466,23 @@ async def login_code_received(
         )
         return LOGIN_CODE
     except PhoneCodeExpired:
-        await message.reply_text(
-            f"<b>{small_caps('OTP Expired. Send /login Again')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return ConversationHandler.END
+        try:
+            client = await get_user_client()
+            resent_code = await client.resend_code(phone, code_hash)
+            context.user_data["login_code_hash"] = resent_code.phone_code_hash
+            await message.reply_text(
+                f"<b>{small_caps('Previous OTP Expired')}.</b>\n\n"
+                f"<b>{small_caps('A New OTP Was Sent. Send Only The Latest Code')}.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return LOGIN_CODE
+        except TelegramError:
+            logger.exception("Could not resend expired Telegram login code")
+            await message.reply_text(
+                f"<b>{small_caps('OTP Expired. Send /login Again')}.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return ConversationHandler.END
     except TelegramError:
         logger.exception("Could not complete Telegram user login")
         await message.reply_text(
@@ -516,6 +528,11 @@ def channel_reference_from_message(message) -> Optional[str]:
     return text or None
 
 
+def normalized_status(status) -> str:
+    value = getattr(status, "value", status)
+    return str(value).lower().split(".")[-1]
+
+
 async def login_channel_received(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
@@ -533,6 +550,45 @@ async def login_channel_received(
     try:
         client = await get_user_client()
         chat = await client.get_chat(reference)
+        logged_in_user = await client.get_me()
+        user_member = await client.get_chat_member(chat.id, logged_in_user.id)
+        user_status = normalized_status(user_member.status)
+        if user_status not in {"administrator", "creator", "owner"}:
+            await message.reply_text(
+                f"<b>{small_caps('The Logged In Telegram Account Must Be An Admin Of This Channel')}.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return LOGIN_CHANNEL
+        if (
+            user_status == "administrator"
+            and getattr(user_member, "can_invite_users", True) is False
+        ):
+            await message.reply_text(
+                f"<b>{small_caps('The Logged In Telegram Account Needs Invite Or Join Request Permission')}.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return LOGIN_CHANNEL
+
+        bot_member = await context.bot.get_chat_member(
+            chat.id, (await context.bot.get_me()).id
+        )
+        bot_status = normalized_status(bot_member.status)
+        if bot_status not in {"administrator", "creator", "owner"}:
+            await message.reply_text(
+                f"<b>{small_caps('The Bot Must Also Be An Admin Of This Channel')}.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return LOGIN_CHANNEL
+        if (
+            bot_status == "administrator"
+            and getattr(bot_member, "can_invite_users", True) is False
+        ):
+            await message.reply_text(
+                f"<b>{small_caps('The Bot Needs Invite Or Join Request Permission In This Channel')}.</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            return LOGIN_CHANNEL
+
         context.user_data["pending_chat_id"] = chat.id
         context.user_data["pending_chat_title"] = chat.title or str(chat.id)
         requests = [
