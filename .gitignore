@@ -47,3 +47,10 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# Python runtime state
+bot_state.json
+bot_state.tmp
+*.session
+*.session-journal
+__pycache__/

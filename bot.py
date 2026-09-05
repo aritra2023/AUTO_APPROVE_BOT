@@ -1,7 +1,9 @@
 import asyncio
 import html
+import json
 import logging
 import os
+from pathlib import Path
 from typing import Optional
 
 from aiohttp import web
@@ -37,6 +39,7 @@ BOT_TOKEN = required_env("TELEGRAM_BOT_TOKEN")
 ADMIN_ID = int(required_env("TELEGRAM_ADMIN_ID"))
 CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
+STATE_FILE = Path(os.getenv("STATE_FILE", "bot_state.json"))
 
 bot_username = ""
 
@@ -50,18 +53,53 @@ def small_caps(text: str) -> str:
     return text.translate(SMALL_CAPS)
 
 
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return {"users": [], "approved": 0, "casts": 0}
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return {
+            "users": sorted({int(user_id) for user_id in state.get("users", [])}),
+            "approved": int(state.get("approved", 0)),
+            "casts": int(state.get("casts", 0)),
+        }
+    except (OSError, ValueError, TypeError):
+        logger.exception("Could not read bot state; starting with empty stats")
+        return {"users": [], "approved": 0, "casts": 0}
+
+
+state = load_state()
+
+
+def save_state() -> None:
+    temporary_file = STATE_FILE.with_suffix(".tmp")
+    temporary_file.write_text(json.dumps(state), encoding="utf-8")
+    temporary_file.replace(STATE_FILE)
+
+
+def remember_user(user_id: int) -> None:
+    if user_id not in state["users"]:
+        state["users"].append(user_id)
+        state["users"].sort()
+        save_state()
+
+
+def is_admin(update: Update) -> bool:
+    return getattr(update.effective_user, "id", None) == ADMIN_ID
+
+
 def welcome_buttons() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "+ " + small_caps("Add Me To Your Group"),
+                    "➕ " + small_caps("Add Me To Your Group"),
                     url=f"https://t.me/{bot_username}?startgroup=true",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "+ " + small_caps("Add Me To Your Channel"),
+                    "➕ " + small_caps("Add Me To Your Channel"),
                     url=f"https://t.me/{bot_username}?startchannel=true",
                 )
             ],
@@ -87,7 +125,7 @@ def accepted_buttons(chat_username: Optional[str]) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     "🙋 " + small_caps("Check I'm Alive Or Not"),
-                    callback_data="alive",
+                    url=f"https://t.me/{bot_username}?start=alive",
                 )
             ],
         ]
@@ -98,20 +136,31 @@ def first_name(user) -> str:
     return (getattr(user, "first_name", None) or "Friend").strip()
 
 
-async def start_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
     if message is None:
         return
 
     logger.info("Received /start from user %s", getattr(user, "id", "unknown"))
+    if user is not None:
+        remember_user(user.id)
+
+    if context.args and context.args[0].lower() == "alive":
+        alive_reply = small_caps("I'm Alive And Accepting Requests")
+        await message.reply_text(
+            f"<b>✅ {alive_reply}.</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     display_name = html.escape(small_caps(first_name(user).title()))
     text = (
-        f"<blockquote>{small_caps('Hello')}, {display_name} ❞</blockquote>\n\n"
-        f"🤖 {small_caps('Welcome To Auto Request Accept Bot')}!\n\n"
-        f"{small_caps('This Bot Automatically Accepts All Join Request From Your Channel Or Group.')} \n\n"
-        f"{small_caps('Just Add Me To Your Group Or Channel')}\n"
-        f"{small_caps('And Make It Admin With Full Rights')}."
+        f"<blockquote><b>{small_caps('Hello')}, {display_name} ❞</b></blockquote>\n\n"
+        f"<b>🤖 {small_caps('Welcome To Auto Request Accept Bot')}!</b>\n\n"
+        f"<b>{small_caps('This Bot Automatically Accepts All Join Request From Your Channel Or Group.')}</b>\n\n"
+        f"<b>{small_caps('Just Add Me To Your Group Or Channel')}\n"
+        f"{small_caps('And Make It Admin With Full Rights')}.</b>"
     )
     try:
         await message.reply_text(
@@ -138,13 +187,61 @@ async def help_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def status_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
-    user = update.effective_user
-    if message is None or getattr(user, "id", None) != ADMIN_ID:
+    if message is None or not is_admin(update):
         return
 
     await message.reply_text(
-        f"✅ {small_caps('Auto Request Acceptor Is Online')}.\n\n"
-        f"{small_caps('Join Requests Are Being Approved Automatically')}."
+        f"<b>✅ {small_caps('Auto Request Acceptor Is Online')}.</b>\n\n"
+        f"<b>{small_caps('Join Requests Are Being Approved Automatically')}.</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def stats_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or not is_admin(update):
+        return
+
+    await message.reply_text(
+        "<b>📊 BOT STATS</b>\n\n"
+        f"<b>Users: {len(state['users'])}</b>\n"
+        f"<b>Approved Requests: {state['approved']}</b>\n"
+        f"<b>Broadcasts: {state['casts']}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cast_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    if message is None or not is_admin(update):
+        return
+
+    source = message.reply_to_message
+    if source is None:
+        await message.reply_text(
+            "<b>Reply to any text, photo, video or document and send /cast.</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    sent = 0
+    failed = 0
+    for user_id in list(state["users"]):
+        try:
+            await context.bot.copy_message(
+                chat_id=user_id,
+                from_chat_id=source.chat_id,
+                message_id=source.message_id,
+            )
+            sent += 1
+        except TelegramError:
+            failed += 1
+
+    state["casts"] += 1
+    save_state()
+    await message.reply_text(
+        f"<b>CAST COMPLETE\n\nSent: {sent}\nFailed: {failed}</b>",
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -153,9 +250,7 @@ async def callback_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
     if callback is None:
         return
 
-    if callback.data == "alive":
-        await callback.answer("✅ I'm alive and accepting requests.", show_alert=True)
-    elif callback.data == "visit_channel":
+    if callback.data == "visit_channel":
         await callback.answer(
             "Set CHANNEL_URL to enable the channel link button.",
             show_alert=True,
@@ -179,18 +274,24 @@ async def join_request_handler(
         logger.exception("Could not approve join request from %s", user_id)
         return
 
+    remember_user(user_id)
+    state["approved"] += 1
+    save_state()
     alive_text = small_caps("Tap Button Below To Check I'm Alive Or Not")
+    accepted_name = html.escape(small_caps(first_name(request.from_user).title()))
+    accepted_chat = html.escape(small_caps(chat_title.title()))
     text = (
-        f"{small_caps('Welcome')}, {small_caps(first_name(request.from_user).title())}!\n\n"
-        f"{small_caps('Your Respected Request Of Joining')} "
-        f"{small_caps(chat_title.title())} "
-        f"{small_caps('Has Been Already Accepted')}.\n\n"
-        f"✅ {alive_text}."
+        f"<b>{small_caps('Welcome')}, {accepted_name}!</b>\n\n"
+        f"<b>{small_caps('Your Respected Request Of Joining')} "
+        f"{accepted_chat} "
+        f"{small_caps('Has Been Already Accepted')}.</b>\n\n"
+        f"<b>☑️ {alive_text}.</b>"
     )
     try:
         await context.bot.send_message(
             user_id,
             text,
+            parse_mode=ParseMode.HTML,
             reply_markup=accepted_buttons(getattr(request.chat, "username", None)),
         )
     except TelegramError:
@@ -217,6 +318,8 @@ def create_application() -> Application:
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler(["help", "what"], help_handler))
     application.add_handler(CommandHandler("status", status_handler))
+    application.add_handler(CommandHandler("stats", stats_handler))
+    application.add_handler(CommandHandler("cast", cast_handler))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(ChatJoinRequestHandler(join_request_handler))
     return application
