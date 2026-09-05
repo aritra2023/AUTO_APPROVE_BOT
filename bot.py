@@ -1,10 +1,12 @@
 import asyncio
+import html
 import logging
 import os
 from typing import Optional
 
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -38,19 +40,28 @@ PORT = int(os.getenv("PORT", "8080"))
 
 bot_username = ""
 
+SMALL_CAPS = str.maketrans(
+    "abcdefghijklmnopqrstuvwxyz",
+    "ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘǫʀsᴛᴜᴠᴡxʏᴢ",
+)
+
+
+def small_caps(text: str) -> str:
+    return text.translate(SMALL_CAPS)
+
 
 def welcome_buttons() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(
-                    "+ ADD ME TO YOUR GROUP",
+                    "+ " + small_caps("Add Me To Your Group"),
                     url=f"https://t.me/{bot_username}?startgroup=true",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    "+ ADD ME TO YOUR CHANNEL",
+                    "+ " + small_caps("Add Me To Your Channel"),
                     url=f"https://t.me/{bot_username}?startchannel=true",
                 )
             ],
@@ -64,16 +75,18 @@ def accepted_buttons(chat_username: Optional[str]) -> InlineKeyboardMarkup:
         channel_url = f"https://t.me/{chat_username}"
 
     visit_button = (
-        InlineKeyboardButton("⏱️ VISIT CHANNEL", url=channel_url)
+        InlineKeyboardButton("⏱️ " + small_caps("Visit Channel"), url=channel_url)
         if channel_url
-        else InlineKeyboardButton("⏱️ VISIT CHANNEL", callback_data="visit_channel")
+        else InlineKeyboardButton(
+            "⏱️ " + small_caps("Visit Channel"), callback_data="visit_channel"
+        )
     )
     return InlineKeyboardMarkup(
         [
             [visit_button],
             [
                 InlineKeyboardButton(
-                    "🙋 CHECK I'M ALIVE OR NOT",
+                    "🙋 " + small_caps("Check I'm Alive Or Not"),
                     callback_data="alive",
                 )
             ],
@@ -92,15 +105,20 @@ async def start_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     logger.info("Received /start from user %s", getattr(user, "id", "unknown"))
+    display_name = html.escape(small_caps(first_name(user).title()))
     text = (
-        f"HELLO, {first_name(user)}!\n\n"
-        "🤖 WELCOME TO AUTO REQUEST ACCEPT BOT!\n\n"
-        "THIS BOT AUTOMATICALLY ACCEPTS ALL JOIN REQUEST FROM YOUR CHANNEL OR GROUP.\n\n"
-        "JUST ADD THIS BOT IN YOUR GROUP OR CHANNEL\n"
-        "AND MAKE IT ADMIN WITH FULL RIGHTS."
+        f"<blockquote>{small_caps('Hello')}, {display_name} ❞</blockquote>\n\n"
+        f"🤖 {small_caps('Welcome To Auto Request Accept Bot')}!\n\n"
+        f"{small_caps('This Bot Automatically Accepts All Join Request From Your Channel Or Group.')} \n\n"
+        f"{small_caps('Just Add Me To Your Group Or Channel')}\n"
+        f"{small_caps('And Make It Admin With Full Rights')}."
     )
     try:
-        await message.reply_text(text, reply_markup=welcome_buttons())
+        await message.reply_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=welcome_buttons(),
+        )
     except TelegramError:
         logger.exception("Could not reply to /start")
 
@@ -111,7 +129,7 @@ async def help_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     text = (
-        "WHAT CAN THIS BOT DO?\n\n"
+        "What can this bot do?\n\n"
         "This Bot can Approve Join Request Automatically.\n\n"
         "Just add bot as Administrator in your channels/groups and it's done ✅"
     )
@@ -125,8 +143,8 @@ async def status_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     await message.reply_text(
-        "✅ AUTO REQUEST ACCEPTOR IS ONLINE.\n\n"
-        "JOIN REQUESTS ARE BEING APPROVED AUTOMATICALLY."
+        f"✅ {small_caps('Auto Request Acceptor Is Online')}.\n\n"
+        f"{small_caps('Join Requests Are Being Approved Automatically')}."
     )
 
 
@@ -161,11 +179,13 @@ async def join_request_handler(
         logger.exception("Could not approve join request from %s", user_id)
         return
 
+    alive_text = small_caps("Tap Button Below To Check I'm Alive Or Not")
     text = (
-        f"WELCOME, {first_name(request.from_user)}!\n\n"
-        f"YOUR RESPECTED REQUEST OF JOINING {chat_title.upper()} "
-        "HAS BEEN ALREADY ACCEPTED.\n\n"
-        "✅ TAP BUTTON BELOW TO CHECK I'M ALIVE OR NOT."
+        f"{small_caps('Welcome')}, {small_caps(first_name(request.from_user).title())}!\n\n"
+        f"{small_caps('Your Respected Request Of Joining')} "
+        f"{small_caps(chat_title.title())} "
+        f"{small_caps('Has Been Already Accepted')}.\n\n"
+        f"✅ {alive_text}."
     )
     try:
         await context.bot.send_message(
