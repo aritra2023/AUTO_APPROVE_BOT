@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 from aiohttp import web
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -14,6 +15,7 @@ from telegram.ext import (
     Application,
     CallbackQueryHandler,
     ChatJoinRequestHandler,
+    ChatMemberHandler,
     CommandHandler,
     ConversationHandler,
     ContextTypes,
@@ -57,17 +59,36 @@ def small_caps(text: str) -> str:
 
 def load_state() -> dict:
     if not STATE_FILE.exists():
-        return {"users": [], "approved": 0, "casts": 0}
+        return {
+            "users": [],
+            "request_users": [],
+            "approved": 0,
+            "casts": 0,
+            "managed_chats": {},
+        }
     try:
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         return {
             "users": sorted({int(user_id) for user_id in state.get("users", [])}),
+            "request_users": sorted(
+                {int(user_id) for user_id in state.get("request_users", [])}
+            ),
             "approved": int(state.get("approved", 0)),
             "casts": int(state.get("casts", 0)),
+            "managed_chats": {
+                str(chat_id): chat
+                for chat_id, chat in state.get("managed_chats", {}).items()
+            },
         }
     except (OSError, ValueError, TypeError):
         logger.exception("Could not read bot state; starting with empty stats")
-        return {"users": [], "approved": 0, "casts": 0}
+        return {
+            "users": [],
+            "request_users": [],
+            "approved": 0,
+            "casts": 0,
+            "managed_chats": {},
+        }
 
 
 state = load_state()
@@ -84,6 +105,26 @@ def remember_user(user_id: int) -> None:
         state["users"].append(user_id)
         state["users"].sort()
         save_state()
+
+
+def remember_request_user(user_id: int) -> None:
+    if user_id not in state["request_users"]:
+        state["request_users"].append(user_id)
+        state["request_users"].sort()
+
+
+def remember_managed_chat(chat) -> None:
+    if chat.type == "channel":
+        kind = "channel"
+    elif chat.type in {"group", "supergroup"}:
+        kind = "group"
+    else:
+        return
+
+    state["managed_chats"][str(chat.id)] = {
+        "type": kind,
+        "title": chat.title or kind.title(),
+    }
 
 
 def is_admin(update: Update) -> bool:
@@ -109,10 +150,17 @@ def welcome_buttons() -> InlineKeyboardMarkup:
     )
 
 
-def accepted_buttons(chat_username: Optional[str]) -> InlineKeyboardMarkup:
-    channel_url = CHANNEL_URL
-    if not channel_url and chat_username:
+def accepted_buttons(
+    chat_username: Optional[str], invite_url: Optional[str] = None
+) -> InlineKeyboardMarkup:
+    if chat_username:
         channel_url = f"https://t.me/{chat_username}"
+    elif invite_url and is_valid_url(invite_url):
+        channel_url = invite_url
+    elif is_valid_url(CHANNEL_URL):
+        channel_url = CHANNEL_URL
+    else:
+        channel_url = ""
 
     visit_button = (
         InlineKeyboardButton("⏱️ " + small_caps("Visit Channel"), url=channel_url)
@@ -134,11 +182,18 @@ def accepted_buttons(chat_username: Optional[str]) -> InlineKeyboardMarkup:
     )
 
 
+def is_valid_url(value: Optional[str]) -> bool:
+    if not value:
+        return False
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
 def first_name(user) -> str:
     return (getattr(user, "first_name", None) or "Friend").strip()
 
 
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     user = update.effective_user
     if message is None:
@@ -147,14 +202,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.info("Received /start from user %s", getattr(user, "id", "unknown"))
     if user is not None:
         remember_user(user.id)
-
-    if context.args and context.args[0].lower() == "alive":
-        alive_reply = small_caps("I'm Alive And Accepting Requests")
-        await message.reply_text(
-            f"<b>✅ {alive_reply}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return
 
     display_name = html.escape(small_caps(first_name(user).title()))
     text = (
@@ -206,8 +253,14 @@ async def stats_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
 
     await message.reply_text(
         f"<b>📊 {small_caps('Bot Stats')}</b>\n\n"
-        f"<b>{small_caps('Users')}: {len(state['users'])}</b>\n"
+        f"<b>{small_caps('Unique Users')}: {len(state['users'])}</b>\n"
+        f"<b>{small_caps('Channels Where Bot Is Admin')}: "
+        f"{sum(chat['type'] == 'channel' for chat in state['managed_chats'].values())}</b>\n"
+        f"<b>{small_caps('Groups Where Bot Is Admin')}: "
+        f"{sum(chat['type'] == 'group' for chat in state['managed_chats'].values())}</b>\n"
         f"<b>{small_caps('Approved Requests')}: {state['approved']}</b>\n"
+        f"<b>{small_caps('Unique Request Users')}: "
+        f"{len(state['request_users'])}</b>\n"
         f"<b>{small_caps('Broadcasts')}: {state['casts']}</b>",
         parse_mode=ParseMode.HTML,
     )
@@ -230,6 +283,7 @@ async def cast_handler(
 
     context.user_data["cast_source_chat_id"] = source.chat_id
     context.user_data["cast_source_message_id"] = source.message_id
+    context.user_data["cast_reply_markup"] = source.reply_markup
     pin_buttons = InlineKeyboardMarkup(
         [
             [
@@ -297,6 +351,7 @@ async def cast_confirm(
 
     source_chat_id = context.user_data.pop("cast_source_chat_id", None)
     source_message_id = context.user_data.pop("cast_source_message_id", None)
+    source_reply_markup = context.user_data.pop("cast_reply_markup", None)
     should_pin = context.user_data.pop("cast_pin", False)
     if source_chat_id is None or source_message_id is None:
         await callback.edit_message_text(
@@ -314,7 +369,7 @@ async def cast_confirm(
                 chat_id=user_id,
                 from_chat_id=source_chat_id,
                 message_id=source_message_id,
-                reply_markup=source.reply_markup,
+                reply_markup=source_reply_markup,
             )
             sent += 1
             if should_pin:
@@ -370,6 +425,24 @@ async def callback_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None
         )
 
 
+async def my_chat_member_handler(
+    update: Update, _: ContextTypes.DEFAULT_TYPE
+) -> None:
+    membership = update.my_chat_member
+    if membership is None:
+        return
+
+    new_status = membership.new_chat_member.status
+    chat_id = str(membership.chat.id)
+    if new_status in {"administrator", "creator"}:
+        remember_managed_chat(membership.chat)
+    elif new_status in {"left", "kicked"}:
+        state["managed_chats"].pop(chat_id, None)
+    else:
+        return
+    save_state()
+
+
 async def join_request_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -389,7 +462,9 @@ async def join_request_handler(
         return
 
     remember_user(user_id)
+    remember_request_user(user_id)
     state["approved"] += 1
+    remember_managed_chat(request.chat)
     save_state()
     alive_text = small_caps("Tap Button Below To Check I'm Alive Or Not")
     accepted_name = html.escape(small_caps(first_name(request.from_user).title()))
@@ -406,7 +481,10 @@ async def join_request_handler(
             delivery_chat_id,
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=accepted_buttons(getattr(request.chat, "username", None)),
+            reply_markup=accepted_buttons(
+                getattr(request.chat, "username", None),
+                getattr(request.invite_link, "invite_link", None),
+            ),
         )
     except TelegramError:
         logger.exception("Could not send welcome message to join-request chat")
@@ -450,6 +528,9 @@ def create_application() -> Application:
         )
     )
     application.add_handler(CallbackQueryHandler(callback_handler))
+    application.add_handler(
+        ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER)
+    )
     application.add_handler(ChatJoinRequestHandler(join_request_handler))
     return application
 
