@@ -221,19 +221,6 @@ async def start_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Could not reply to /start")
 
 
-async def help_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.effective_message
-    if message is None:
-        return
-
-    text = (
-        f"<b>{small_caps('What Can This Bot Do?')}</b>\n\n"
-        f"<b>{small_caps('This Bot Can Approve Join Request Automatically.')}</b>\n\n"
-        f"<b>{small_caps('Just Add Bot As Administrator In Your Channels Or Groups And It Is Done')} ✅</b>"
-    )
-    await message.reply_text(text, parse_mode=ParseMode.HTML)
-
-
 async def status_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     if message is None or not is_admin(update):
@@ -460,6 +447,7 @@ async def join_request_handler(
 
     remember_user(user_id)
     remember_managed_chat(request.chat)
+    visit_url = await resolve_visit_url(context.bot, request.chat)
     alive_text = small_caps("Tap Button Below To Check I'm Alive Or Not")
     accepted_name = html.escape(small_caps(first_name(request.from_user).title()))
     accepted_chat = html.escape(small_caps(chat_title.title()))
@@ -477,12 +465,41 @@ async def join_request_handler(
             parse_mode=ParseMode.HTML,
             reply_markup=accepted_buttons(
                 getattr(request.chat, "username", None),
-                getattr(request.invite_link, "invite_link", None),
+                visit_url,
             ),
         )
     except TelegramError:
         logger.exception("Could not send welcome message to join-request chat")
     await persist_state()
+
+
+async def resolve_visit_url(bot, chat) -> Optional[str]:
+    """Return a current public username URL or a non-expiring invite URL."""
+    if getattr(chat, "username", None):
+        return f"https://t.me/{chat.username}"
+
+    try:
+        full_chat = await bot.get_chat(chat.id)
+        if getattr(full_chat, "username", None):
+            return f"https://t.me/{full_chat.username}"
+        current_invite = getattr(full_chat, "invite_link", None)
+        if is_valid_url(current_invite):
+            return current_invite
+    except TelegramError:
+        logger.exception("Could not fetch current invite link for chat %s", chat.id)
+
+    try:
+        invite = await bot.create_chat_invite_link(
+            chat_id=chat.id,
+            name="Auto Request Acceptor Visit Link",
+            creates_join_request=False,
+        )
+        if is_valid_url(invite.invite_link):
+            return invite.invite_link
+    except TelegramError:
+        logger.exception("Could not create a fresh invite link for chat %s", chat.id)
+
+    return CHANNEL_URL if is_valid_url(CHANNEL_URL) else None
 
 
 async def health(_: web.Request) -> web.Response:
@@ -513,7 +530,6 @@ def create_application() -> Application:
         .build()
     )
     application.add_handler(CommandHandler("start", start_handler))
-    application.add_handler(CommandHandler(["help", "what"], help_handler))
     application.add_handler(CommandHandler("status", status_handler))
     application.add_handler(CommandHandler("stats", stats_handler))
     application.add_handler(
