@@ -19,6 +19,8 @@ Optional:
 - `CHANNEL_URL` — fallback link for the “VISIT CHANNEL” button when a join request does not include a channel username or invite link
 - `PORT` — health endpoint port; defaults to `8080`
 - `STATE_FILE` — local stats/user state path; defaults to `bot_state.json`
+- `MONGO_URL` — optional MongoDB connection string; when configured, users, casts, and managed chats survive restarts
+- `MONGO_DB_NAME` — MongoDB database name; defaults to `auto_join_acceptor`
 
 The bot must be added as an administrator with permission to invite users via link / approve join requests.
 

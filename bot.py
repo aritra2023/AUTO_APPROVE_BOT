@@ -4,10 +4,11 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 from aiohttp import web
+from pymongo import MongoClient
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -47,6 +48,8 @@ ADMIN_ID = int(required_env("TELEGRAM_ADMIN_ID"))
 CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "bot_state.json"))
+MONGO_URL = os.getenv("MONGO_URL", "").strip()
+MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "auto_join_acceptor").strip()
 
 bot_username = ""
 CAST_PIN, CAST_CONFIRM = range(2)
@@ -61,35 +64,45 @@ def small_caps(text: str) -> str:
     return text.translate(SMALL_CAPS)
 
 
-def load_state() -> dict:
-    if not STATE_FILE.exists():
-        return {
-            "users": [],
-            "casts": 0,
-            "managed_chats": {},
-        }
+def empty_state() -> dict:
+    return {"users": [], "casts": 0, "managed_chats": {}}
+
+
+def normalize_state(raw_state: Any) -> dict:
+    if not isinstance(raw_state, dict):
+        return empty_state()
     try:
-        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        managed_chats = raw_state.get("managed_chats", {})
+        if not isinstance(managed_chats, dict):
+            managed_chats = {}
         return {
-            "users": sorted({int(user_id) for user_id in state.get("users", [])}),
-            "casts": int(state.get("casts", 0)),
+            "users": sorted({int(user_id) for user_id in raw_state.get("users", [])}),
+            "casts": int(raw_state.get("casts", 0)),
             "managed_chats": {
                 str(chat_id): chat
-                for chat_id, chat in state.get("managed_chats", {}).items()
+                for chat_id, chat in managed_chats.items()
+                if isinstance(chat, dict)
             },
         }
+    except (ValueError, TypeError):
+        return empty_state()
+
+
+def load_state() -> dict:
+    if not STATE_FILE.exists():
+        return empty_state()
+    try:
+        return normalize_state(json.loads(STATE_FILE.read_text(encoding="utf-8")))
     except (OSError, ValueError, TypeError):
         logger.exception("Could not read bot state; starting with empty stats")
-        return {
-            "users": [],
-            "casts": 0,
-            "managed_chats": {},
-        }
+        return empty_state()
 
 
 state = load_state()
 known_users = set(state["users"])
 state_save_lock = asyncio.Lock()
+mongo_client: Any = None
+mongo_collection: Any = None
 
 
 def save_state(snapshot: Optional[str] = None) -> None:
@@ -99,10 +112,64 @@ def save_state(snapshot: Optional[str] = None) -> None:
     temporary_file.replace(STATE_FILE)
 
 
+def save_mongo_state(snapshot: str) -> None:
+    if mongo_collection is None:
+        return
+    document = json.loads(snapshot)
+    document["_id"] = "main"
+    mongo_collection.replace_one({"_id": "main"}, document, upsert=True)
+
+
 async def persist_state() -> None:
     async with state_save_lock:
         snapshot = json.dumps(state)
         await asyncio.to_thread(save_state, snapshot)
+        if mongo_collection is not None:
+            try:
+                await asyncio.to_thread(save_mongo_state, snapshot)
+            except Exception:
+                logger.exception("Could not persist state to MongoDB")
+
+
+async def initialize_persistence() -> None:
+    global state, known_users, mongo_client, mongo_collection
+
+    if not MONGO_URL:
+        logger.warning("MONGO_URL is not configured; using local state only")
+        return
+
+    try:
+        mongo_client = MongoClient(
+            MONGO_URL,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000,
+            socketTimeoutMS=10000,
+            appname="auto-join-acceptor",
+        )
+        mongo_collection = mongo_client[MONGO_DB_NAME]["state"]
+        await asyncio.to_thread(mongo_client.admin.command, "ping")
+        remote_state = await asyncio.to_thread(
+            mongo_collection.find_one, {"_id": "main"}
+        )
+        if remote_state:
+            state = normalize_state(remote_state)
+            known_users = set(state["users"])
+            await asyncio.to_thread(save_state, json.dumps(state))
+            logger.info("Loaded bot state from MongoDB")
+        else:
+            await asyncio.to_thread(save_mongo_state, json.dumps(state))
+            logger.info("Seeded MongoDB with existing local bot state")
+    except Exception:
+        logger.exception("MongoDB unavailable; continuing with local state")
+        if mongo_client is not None:
+            await asyncio.to_thread(mongo_client.close)
+        mongo_client = None
+        mongo_collection = None
+
+
+async def close_persistence() -> None:
+    if mongo_client is not None:
+        await asyncio.to_thread(mongo_client.close)
 
 
 def remember_user(user_id: int) -> bool:
@@ -560,6 +627,7 @@ async def main() -> None:
     global bot_username
 
     application = create_application()
+    await initialize_persistence()
     await application.initialize()
     bot = await application.bot.get_me()
     bot_username = bot.username or ""
@@ -580,6 +648,7 @@ async def main() -> None:
         await application.updater.stop()
         await application.stop()
         await application.shutdown()
+        await close_persistence()
 
 
 if __name__ == "__main__":

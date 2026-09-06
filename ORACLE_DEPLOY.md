@@ -91,10 +91,12 @@ TELEGRAM_ADMIN_ID=YOUR_TELEGRAM_USER_ID
 CHANNEL_URL=https://t.me/YOUR_CHANNEL
 PORT=8082
 STATE_FILE=/opt/auto-join-bot/bot_state.json
+MONGO_URL=YOUR_MONGODB_CONNECTION_STRING
+MONGO_DB_NAME=auto_join_acceptor
 ```
 
 `CHANNEL_URL` is optional when join requests come from a public channel or an
-invite link. Protect the file:
+invite link. `MONGO_URL` should be kept private. Protect the file:
 
 ```bash
 chmod 600 /opt/auto-join-bot/.env
