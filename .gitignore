@@ -54,3 +54,5 @@ bot_state.tmp
 __pycache__/
 .venv/
 .env
+*.session
+*.session-journal
