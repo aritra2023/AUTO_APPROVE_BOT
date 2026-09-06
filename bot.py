@@ -13,6 +13,7 @@ from pyrogram.errors import (
     FloodWait,
     PhoneCodeExpired,
     PhoneCodeInvalid,
+    RPCError as PyrogramRPCError,
     SessionPasswordNeeded,
     Unauthorized,
 )
@@ -422,7 +423,7 @@ async def login_contact_received(
             reply_markup=ReplyKeyboardRemove(),
         )
         return LOGIN_CODE
-    except TelegramError:
+    except (PyrogramRPCError, TelegramError):
         logger.exception("Could not start Telegram user login")
         await message.reply_text(
             f"<b>{small_caps('Could Not Send OTP. Please Check The Contact And Try Again')}.</b>",
@@ -476,14 +477,14 @@ async def login_code_received(
                 parse_mode=ParseMode.HTML,
             )
             return LOGIN_CODE
-        except TelegramError:
+        except PyrogramRPCError:
             logger.exception("Could not resend expired Telegram login code")
             await message.reply_text(
                 f"<b>{small_caps('OTP Expired. Send /login Again')}.</b>",
                 parse_mode=ParseMode.HTML,
             )
             return ConversationHandler.END
-    except TelegramError:
+    except (PyrogramRPCError, TelegramError):
         logger.exception("Could not complete Telegram user login")
         await message.reply_text(
             f"<b>{small_caps('Login Failed. Please Send /login Again')}.</b>",
@@ -502,7 +503,7 @@ async def login_password_received(
         client = await get_user_client()
         await client.check_password(message.text)
         return await show_channel_prompt(message)
-    except TelegramError:
+    except (PyrogramRPCError, TelegramError):
         logger.exception("Could not complete Telegram 2FA login")
         await message.reply_text(
             f"<b>{small_caps('Invalid 2FA Password. Try Again')}.</b>",
@@ -625,7 +626,7 @@ async def login_channel_received(
             reply_markup=mode_buttons,
         )
         return LOGIN_MODE
-    except TelegramError:
+    except (PyrogramRPCError, TelegramError):
         logger.exception("Could not load channel join requests")
         await message.reply_text(
             f"<b>{small_caps('Could Not Access This Channel. Make Sure The Logged In Account Is Admin')}.</b>",
@@ -752,12 +753,12 @@ async def process_pending_requests(
                 try:
                     await client.approve_chat_join_request(chat_id, request.user.id)
                     approved += 1
-                except TelegramError:
+                except PyrogramRPCError:
                     failed += 1
-            except TelegramError:
+            except (PyrogramRPCError, TelegramError):
                 failed += 1
             await asyncio.sleep(0.05)
-    except TelegramError:
+    except (PyrogramRPCError, TelegramError):
         logger.exception("Could not process pending requests")
         if progress_message is not None:
             await progress_message.edit_text(
@@ -1061,6 +1062,7 @@ def create_application() -> Application:
                 ],
             },
             fallbacks=[CommandHandler("cancel", login_cancel)],
+            allow_reentry=True,
             per_user=True,
             per_chat=True,
         )
