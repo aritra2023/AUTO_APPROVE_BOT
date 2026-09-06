@@ -8,21 +8,9 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from aiohttp import web
-from pyrogram import Client
-from pyrogram.errors import (
-    FloodWait,
-    PhoneCodeExpired,
-    PhoneCodeInvalid,
-    RPCError as PyrogramRPCError,
-    SessionPasswordNeeded,
-    Unauthorized,
-)
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
-    ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
     Update,
 )
 from telegram.constants import ParseMode
@@ -35,8 +23,6 @@ from telegram.ext import (
     CommandHandler,
     ConversationHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
 )
 
 
@@ -61,15 +47,9 @@ ADMIN_ID = int(required_env("TELEGRAM_ADMIN_ID"))
 CHANNEL_URL = os.getenv("CHANNEL_URL", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "bot_state.json"))
-TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID", "0") or "0")
-TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH", "").strip()
 
 bot_username = ""
 CAST_PIN, CAST_CONFIRM = range(2)
-LOGIN_CONTACT, LOGIN_CODE, LOGIN_PASSWORD, LOGIN_CHANNEL, LOGIN_MODE, LOGIN_COUNT = range(
-    10, 16
-)
-user_client: Optional[Client] = None
 
 SMALL_CAPS = str.maketrans(
     "abcdefghijklmnopqrstuvwxyz",
@@ -85,8 +65,6 @@ def load_state() -> dict:
     if not STATE_FILE.exists():
         return {
             "users": [],
-            "request_users": [],
-            "approved": 0,
             "casts": 0,
             "managed_chats": {},
         }
@@ -94,10 +72,6 @@ def load_state() -> dict:
         state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         return {
             "users": sorted({int(user_id) for user_id in state.get("users", [])}),
-            "request_users": sorted(
-                {int(user_id) for user_id in state.get("request_users", [])}
-            ),
-            "approved": int(state.get("approved", 0)),
             "casts": int(state.get("casts", 0)),
             "managed_chats": {
                 str(chat_id): chat
@@ -108,33 +82,35 @@ def load_state() -> dict:
         logger.exception("Could not read bot state; starting with empty stats")
         return {
             "users": [],
-            "request_users": [],
-            "approved": 0,
             "casts": 0,
             "managed_chats": {},
         }
 
 
 state = load_state()
+known_users = set(state["users"])
+state_save_lock = asyncio.Lock()
 
 
-def save_state() -> None:
+def save_state(snapshot: Optional[str] = None) -> None:
+    payload = snapshot if snapshot is not None else json.dumps(state)
     temporary_file = STATE_FILE.with_suffix(".tmp")
-    temporary_file.write_text(json.dumps(state), encoding="utf-8")
+    temporary_file.write_text(payload, encoding="utf-8")
     temporary_file.replace(STATE_FILE)
 
 
-def remember_user(user_id: int) -> None:
-    if user_id not in state["users"]:
+async def persist_state() -> None:
+    async with state_save_lock:
+        snapshot = json.dumps(state)
+        await asyncio.to_thread(save_state, snapshot)
+
+
+def remember_user(user_id: int) -> bool:
+    if user_id not in known_users:
+        known_users.add(user_id)
         state["users"].append(user_id)
-        state["users"].sort()
-        save_state()
-
-
-def remember_request_user(user_id: int) -> None:
-    if user_id not in state["request_users"]:
-        state["request_users"].append(user_id)
-        state["request_users"].sort()
+        return True
+    return False
 
 
 def remember_managed_chat(chat) -> None:
@@ -224,8 +200,8 @@ async def start_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     logger.info("Received /start from user %s", getattr(user, "id", "unknown"))
-    if user is not None:
-        remember_user(user.id)
+    if user is not None and remember_user(user.id):
+        asyncio.create_task(persist_state())
 
     display_name = html.escape(small_caps(first_name(user).title()))
     text = (
@@ -284,498 +260,6 @@ async def stats_handler(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         f"{sum(chat['type'] == 'group' for chat in state['managed_chats'].values())}</b>",
         parse_mode=ParseMode.HTML,
     )
-
-
-def user_client_configured() -> bool:
-    return TELEGRAM_API_ID > 0 and bool(TELEGRAM_API_HASH)
-
-
-async def get_user_client() -> Client:
-    global user_client
-    if not user_client_configured():
-        raise RuntimeError("Telegram API ID and API hash are not configured.")
-    if user_client is None:
-        user_client = Client(
-            "admin_user",
-            api_id=TELEGRAM_API_ID,
-            api_hash=TELEGRAM_API_HASH,
-        )
-    if not user_client.is_connected:
-        await user_client.connect()
-    return user_client
-
-
-async def show_channel_prompt(message) -> int:
-    await message.reply_text(
-        f"<b>{small_caps('Login Done')} ✅</b>\n\n"
-        f"<b>{small_caps('Send The Channel ID, @Username, Or Forward Any Message From That Channel')}.</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardRemove(),
-    )
-    return LOGIN_CHANNEL
-
-
-async def login_handler(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    message = update.effective_message
-    if message is None or not is_admin(update):
-        return ConversationHandler.END
-    if update.effective_chat and update.effective_chat.type != "private":
-        await message.reply_text(
-            f"<b>{small_caps('Use /login In The Bot Private Chat')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return ConversationHandler.END
-
-    context.user_data.clear()
-    if user_client is not None and user_client.is_connected:
-        try:
-            await user_client.get_me()
-            return await show_channel_prompt(message)
-        except Unauthorized:
-            pass
-
-    buttons = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "✅ " + small_caps("Yes, Continue"),
-                    callback_data="login_contact_yes",
-                ),
-                InlineKeyboardButton(
-                    "❌ " + small_caps("Cancel"),
-                    callback_data="login_contact_no",
-                ),
-            ]
-        ]
-    )
-    await message.reply_text(
-        f"<b>{small_caps('Telegram Login Required')}.</b>\n\n"
-        f"<b>{small_caps('Do You Want To Share Your Telegram Contact For Login?')}</b>\n\n"
-        f"<b>{small_caps('Your OTP And Password Will Not Be Saved Or Logged')}.</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=buttons,
-    )
-    return LOGIN_CONTACT
-
-
-async def login_contact_choice(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    callback = update.callback_query
-    if callback is None:
-        return ConversationHandler.END
-    await callback.answer()
-    if callback.data == "login_contact_no":
-        context.user_data.clear()
-        await callback.edit_message_text(
-            f"<b>{small_caps('Login Cancelled')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return ConversationHandler.END
-
-    await callback.edit_message_text(
-        f"<b>{small_caps('Please Press The Button Below And Share Your Own Telegram Contact')}.</b>",
-        parse_mode=ParseMode.HTML,
-    )
-    await callback.message.reply_text(
-        f"<b>{small_caps('Share Contact')}</b>",
-        parse_mode=ParseMode.HTML,
-        reply_markup=ReplyKeyboardMarkup(
-            [[KeyboardButton("📱 " + small_caps("Share My Contact"), request_contact=True)]],
-            resize_keyboard=True,
-            one_time_keyboard=True,
-        ),
-    )
-    return LOGIN_CONTACT
-
-
-async def login_contact_received(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    message = update.effective_message
-    contact = message.contact if message else None
-    if message is None or contact is None:
-        return LOGIN_CONTACT
-    if contact.user_id and contact.user_id != ADMIN_ID:
-        await message.reply_text(
-            f"<b>{small_caps('Please Share Your Own Contact, Not Someone Else')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return LOGIN_CONTACT
-
-    try:
-        client = await get_user_client()
-        try:
-            await client.get_me()
-            return await show_channel_prompt(message)
-        except Unauthorized:
-            pass
-
-        sent_code = await client.send_code(contact.phone_number)
-        context.user_data["login_phone"] = contact.phone_number
-        context.user_data["login_code_hash"] = sent_code.phone_code_hash
-        await message.reply_text(
-            f"<b>{small_caps('OTP Sent')}.</b>\n\n"
-            f"<b>{small_caps('Send The Telegram Login Code Here')}.</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return LOGIN_CODE
-    except (PyrogramRPCError, TelegramError):
-        logger.exception("Could not start Telegram user login")
-        await message.reply_text(
-            f"<b>{small_caps('Could Not Send OTP. Please Check The Contact And Try Again')}.</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=ReplyKeyboardRemove(),
-        )
-        return ConversationHandler.END
-
-
-async def login_code_received(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    message = update.effective_message
-    if message is None or not message.text:
-        return LOGIN_CODE
-    code = "".join(message.text.split())
-    phone = context.user_data.get("login_phone")
-    code_hash = context.user_data.get("login_code_hash")
-    if not phone or not code_hash:
-        await message.reply_text(
-            f"<b>{small_caps('Login Session Expired. Send /login Again')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return ConversationHandler.END
-
-    try:
-        client = await get_user_client()
-        await client.sign_in(phone, code_hash, code)
-        return await show_channel_prompt(message)
-    except SessionPasswordNeeded:
-        await message.reply_text(
-            f"<b>{small_caps('Two Step Verification Is Enabled')}.</b>\n\n"
-            f"<b>{small_caps('Send Your Telegram 2FA Password')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return LOGIN_PASSWORD
-    except PhoneCodeInvalid:
-        await message.reply_text(
-            f"<b>{small_caps('Invalid OTP. Send The Correct Code')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return LOGIN_CODE
-    except PhoneCodeExpired:
-        try:
-            client = await get_user_client()
-            resent_code = await client.resend_code(phone, code_hash)
-            context.user_data["login_code_hash"] = resent_code.phone_code_hash
-            await message.reply_text(
-                f"<b>{small_caps('Previous OTP Expired')}.</b>\n\n"
-                f"<b>{small_caps('A New OTP Was Sent. Send Only The Latest Code')}.</b>",
-                parse_mode=ParseMode.HTML,
-            )
-            return LOGIN_CODE
-        except PyrogramRPCError:
-            logger.exception("Could not resend expired Telegram login code")
-            await message.reply_text(
-                f"<b>{small_caps('OTP Expired. Send /login Again')}.</b>",
-                parse_mode=ParseMode.HTML,
-            )
-            return ConversationHandler.END
-    except (PyrogramRPCError, TelegramError):
-        logger.exception("Could not complete Telegram user login")
-        await message.reply_text(
-            f"<b>{small_caps('Login Failed. Please Send /login Again')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return ConversationHandler.END
-
-
-async def login_password_received(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    message = update.effective_message
-    if message is None or not message.text:
-        return LOGIN_PASSWORD
-    try:
-        client = await get_user_client()
-        await client.check_password(message.text)
-        return await show_channel_prompt(message)
-    except (PyrogramRPCError, TelegramError):
-        logger.exception("Could not complete Telegram 2FA login")
-        await message.reply_text(
-            f"<b>{small_caps('Invalid 2FA Password. Try Again')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return LOGIN_PASSWORD
-
-
-def forwarded_channel_id(message) -> Optional[int]:
-    origin = getattr(message, "forward_origin", None)
-    origin_chat = getattr(origin, "chat", None)
-    if origin_chat is not None:
-        return origin_chat.id
-    old_forwarded_chat = getattr(message, "forward_from_chat", None)
-    return getattr(old_forwarded_chat, "id", None)
-
-
-def channel_reference_from_message(message) -> Optional[str]:
-    forwarded_id = forwarded_channel_id(message)
-    if forwarded_id is not None:
-        return str(forwarded_id)
-    text = (message.text or "").strip()
-    return text or None
-
-
-def normalized_status(status) -> str:
-    value = getattr(status, "value", status)
-    return str(value).lower().split(".")[-1]
-
-
-async def login_channel_received(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    message = update.effective_message
-    if message is None:
-        return LOGIN_CHANNEL
-    reference = channel_reference_from_message(message)
-    if not reference:
-        await message.reply_text(
-            f"<b>{small_caps('Send A Channel ID, @Username, Or Forward A Channel Message')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return LOGIN_CHANNEL
-
-    try:
-        client = await get_user_client()
-        chat = await client.get_chat(reference)
-        logged_in_user = await client.get_me()
-        user_member = await client.get_chat_member(chat.id, logged_in_user.id)
-        user_status = normalized_status(user_member.status)
-        if user_status not in {"administrator", "creator", "owner"}:
-            await message.reply_text(
-                f"<b>{small_caps('The Logged In Telegram Account Must Be An Admin Of This Channel')}.</b>",
-                parse_mode=ParseMode.HTML,
-            )
-            return LOGIN_CHANNEL
-        if (
-            user_status == "administrator"
-            and getattr(user_member, "can_invite_users", True) is False
-        ):
-            await message.reply_text(
-                f"<b>{small_caps('The Logged In Telegram Account Needs Invite Or Join Request Permission')}.</b>",
-                parse_mode=ParseMode.HTML,
-            )
-            return LOGIN_CHANNEL
-
-        bot_member = await context.bot.get_chat_member(
-            chat.id, (await context.bot.get_me()).id
-        )
-        bot_status = normalized_status(bot_member.status)
-        if bot_status not in {"administrator", "creator", "owner"}:
-            await message.reply_text(
-                f"<b>{small_caps('The Bot Must Also Be An Admin Of This Channel')}.</b>",
-                parse_mode=ParseMode.HTML,
-            )
-            return LOGIN_CHANNEL
-        if (
-            bot_status == "administrator"
-            and getattr(bot_member, "can_invite_users", True) is False
-        ):
-            await message.reply_text(
-                f"<b>{small_caps('The Bot Needs Invite Or Join Request Permission In This Channel')}.</b>",
-                parse_mode=ParseMode.HTML,
-            )
-            return LOGIN_CHANNEL
-
-        context.user_data["pending_chat_id"] = chat.id
-        context.user_data["pending_chat_title"] = chat.title or str(chat.id)
-        requests = [
-            request
-            async for request in client.get_chat_join_requests(chat.id, limit=1)
-        ]
-        if not requests:
-            await message.reply_text(
-                f"<b>{small_caps('No Pending Join Requests Found In')} "
-                f"{html.escape(small_caps((chat.title or str(chat.id)).title()))}.</b>",
-                parse_mode=ParseMode.HTML,
-            )
-            return ConversationHandler.END
-
-        mode_buttons = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "✅ " + small_caps("All"),
-                        callback_data="login_requests_all",
-                    ),
-                    InlineKeyboardButton(
-                        "🔢 " + small_caps("Custom"),
-                        callback_data="login_requests_custom",
-                    ),
-                ]
-            ]
-        )
-        await message.reply_text(
-            f"<b>{small_caps('Channel')}: "
-            f"{html.escape(small_caps((chat.title or str(chat.id)).title()))}</b>\n\n"
-            f"<b>{small_caps('How Many Pending Requests Should Be Accepted?')}</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=mode_buttons,
-        )
-        return LOGIN_MODE
-    except (PyrogramRPCError, TelegramError):
-        logger.exception("Could not load channel join requests")
-        await message.reply_text(
-            f"<b>{small_caps('Could Not Access This Channel. Make Sure The Logged In Account Is Admin')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return LOGIN_CHANNEL
-
-
-async def custom_count_prompt(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    message = update.effective_message
-    if message is not None:
-        await message.reply_text(
-            f"<b>{small_caps('How Many Requests Should Be Accepted? Send A Number')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-    return LOGIN_COUNT
-
-
-async def login_mode_choice(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    callback = update.callback_query
-    if callback is None:
-        return ConversationHandler.END
-    await callback.answer()
-    if callback.data == "login_requests_custom":
-        await callback.edit_message_text(
-            f"<b>{small_caps('How Many Requests Should Be Accepted? Send A Number')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return LOGIN_COUNT
-    return await process_pending_requests(update, context, 0)
-
-
-async def login_mode_text(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    message = update.effective_message
-    choice = (message.text or "").strip().lower() if message else ""
-    if choice in {"custom", "customs"}:
-        return await custom_count_prompt(update, context)
-    if choice == "all":
-        return await process_pending_requests(update, context, 0)
-    if message is not None:
-        await message.reply_text(
-            f"<b>{small_caps('Choose All Or Custom')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-    return LOGIN_MODE
-
-
-async def login_count_received(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    message = update.effective_message
-    if message is None or not message.text:
-        return LOGIN_COUNT
-    try:
-        count = int(message.text.strip())
-        if count < 1:
-            raise ValueError
-    except ValueError:
-        await message.reply_text(
-            f"<b>{small_caps('Send A Valid Positive Number')}.</b>",
-            parse_mode=ParseMode.HTML,
-        )
-        return LOGIN_COUNT
-    return await process_pending_requests(update, context, count)
-
-
-async def login_cancel(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> int:
-    context.user_data.clear()
-    message = update.effective_message
-    if message is not None:
-        await message.reply_text(
-            f"<b>{small_caps('Login Cancelled')}.</b>",
-            parse_mode=ParseMode.HTML,
-            reply_markup=ReplyKeyboardRemove(),
-        )
-    return ConversationHandler.END
-
-
-async def process_pending_requests(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, limit: int
-) -> int:
-    message = update.effective_message
-    chat_id = context.user_data.get("pending_chat_id")
-    chat_title = context.user_data.get("pending_chat_title", "channel")
-    if chat_id is None:
-        if message is not None:
-            await message.reply_text(
-                f"<b>{small_caps('Channel Selection Expired. Send /login Again')}.</b>",
-                parse_mode=ParseMode.HTML,
-            )
-        return ConversationHandler.END
-
-    progress_message = None
-    if message is not None:
-        progress_message = await message.reply_text(
-            f"<b>{small_caps('Starting Request Approval For')} "
-            f"{html.escape(small_caps(str(chat_title).title()))}...</b>",
-            parse_mode=ParseMode.HTML,
-        )
-
-    approved = 0
-    failed = 0
-    try:
-        client = await get_user_client()
-        async for request in client.get_chat_join_requests(chat_id, limit=limit):
-            try:
-                await client.approve_chat_join_request(chat_id, request.user.id)
-                approved += 1
-                if approved % 25 == 0 and progress_message is not None:
-                    await progress_message.edit_text(
-                        f"<b>{small_caps('Approved')}: {approved}</b>",
-                        parse_mode=ParseMode.HTML,
-                    )
-            except FloodWait as error:
-                await asyncio.sleep(error.value)
-                try:
-                    await client.approve_chat_join_request(chat_id, request.user.id)
-                    approved += 1
-                except PyrogramRPCError:
-                    failed += 1
-            except (PyrogramRPCError, TelegramError):
-                failed += 1
-            await asyncio.sleep(0.05)
-    except (PyrogramRPCError, TelegramError):
-        logger.exception("Could not process pending requests")
-        if progress_message is not None:
-            await progress_message.edit_text(
-                f"<b>{small_caps('Could Not Read Pending Requests')}.</b>",
-                parse_mode=ParseMode.HTML,
-            )
-        return ConversationHandler.END
-
-    if progress_message is not None:
-        await progress_message.edit_text(
-            f"<b>✅ {small_caps('Request Approval Complete')}</b>\n\n"
-            f"<b>{small_caps('Approved')}: {approved}\n"
-            f"{small_caps('Failed')}: {failed}</b>",
-            parse_mode=ParseMode.HTML,
-        )
-    context.user_data.clear()
-    return ConversationHandler.END
 
 
 async def cast_handler(
@@ -897,7 +381,7 @@ async def cast_confirm(
             failed += 1
 
     state["casts"] += 1
-    save_state()
+    await persist_state()
     result = (
         f"<b>✅ {small_caps('Cast Complete')}</b>\n\n"
         f"<b>"
@@ -953,7 +437,7 @@ async def my_chat_member_handler(
         state["managed_chats"].pop(chat_id, None)
     else:
         return
-    save_state()
+    await persist_state()
 
 
 async def join_request_handler(
@@ -975,10 +459,7 @@ async def join_request_handler(
         return
 
     remember_user(user_id)
-    remember_request_user(user_id)
-    state["approved"] += 1
     remember_managed_chat(request.chat)
-    save_state()
     alive_text = small_caps("Tap Button Below To Check I'm Alive Or Not")
     accepted_name = html.escape(small_caps(first_name(request.from_user).title()))
     accepted_chat = html.escape(small_caps(chat_title.title()))
@@ -1001,6 +482,7 @@ async def join_request_handler(
         )
     except TelegramError:
         logger.exception("Could not send welcome message to join-request chat")
+    await persist_state()
 
 
 async def health(_: web.Request) -> web.Response:
@@ -1019,54 +501,21 @@ async def start_health_server() -> web.AppRunner:
 
 
 def create_application() -> Application:
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connection_pool_size(64)
+        .get_updates_connection_pool_size(4)
+        .pool_timeout(10)
+        .connect_timeout(10)
+        .read_timeout(30)
+        .write_timeout(30)
+        .build()
+    )
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler(["help", "what"], help_handler))
     application.add_handler(CommandHandler("status", status_handler))
     application.add_handler(CommandHandler("stats", stats_handler))
-    application.add_handler(
-        ConversationHandler(
-            entry_points=[CommandHandler("login", login_handler)],
-            states={
-                LOGIN_CONTACT: [
-                    CallbackQueryHandler(
-                        login_contact_choice, pattern="^login_contact_"
-                    ),
-                    MessageHandler(filters.CONTACT, login_contact_received),
-                ],
-                LOGIN_CODE: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, login_code_received)
-                ],
-                LOGIN_PASSWORD: [
-                    MessageHandler(
-                        filters.TEXT & ~filters.COMMAND, login_password_received
-                    )
-                ],
-                LOGIN_CHANNEL: [
-                    MessageHandler(
-                        (filters.TEXT | filters.FORWARDED) & ~filters.COMMAND,
-                        login_channel_received,
-                    )
-                ],
-                LOGIN_MODE: [
-                    CallbackQueryHandler(
-                        login_mode_choice, pattern="^login_requests_"
-                    ),
-                    CommandHandler(["custom", "customs"], custom_count_prompt),
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, login_mode_text),
-                ],
-                LOGIN_COUNT: [
-                    MessageHandler(
-                        filters.TEXT & ~filters.COMMAND, login_count_received
-                    )
-                ],
-            },
-            fallbacks=[CommandHandler("cancel", login_cancel)],
-            allow_reentry=True,
-            per_user=True,
-            per_chat=True,
-        )
-    )
     application.add_handler(
         ConversationHandler(
             entry_points=[CommandHandler("cast", cast_handler)],
@@ -1087,7 +536,7 @@ def create_application() -> Application:
     application.add_handler(
         ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER)
     )
-    application.add_handler(ChatJoinRequestHandler(join_request_handler))
+    application.add_handler(ChatJoinRequestHandler(join_request_handler, block=False))
     return application
 
 
@@ -1102,7 +551,9 @@ async def main() -> None:
         raise RuntimeError("The bot account must have a username.")
 
     await application.start()
-    await application.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    await application.updater.start_polling(
+        allowed_updates=["message", "callback_query", "chat_join_request", "my_chat_member"]
+    )
     runner = await start_health_server()
     logger.info("@%s is ready.", bot_username)
 
