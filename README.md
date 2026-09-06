@@ -39,7 +39,8 @@ Use the same command on both platforms:
 python bot.py
 ```
 
-Keep the two required values in environment variables or secrets. MongoDB is not required by this version.
+Keep the two required values in environment variables or secrets. MongoDB is
+optional in development, but recommended for Oracle so state survives restarts.
 
 The web endpoint is available at `/health` and returns a small JSON status response.
 
