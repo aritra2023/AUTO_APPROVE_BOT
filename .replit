@@ -1,4 +1,4 @@
-modules = ["nodejs-24", "python-3.11"]
+modules = ["nodejs-20", "python-3.12", "web"]
 
 [deployment]
 router = "application"
@@ -46,3 +46,4 @@ channel = "stable-25_05"
 [userenv]
 
 [userenv.shared]
+TELEGRAM_BOT_TOKEN = "8646886186:AAFYAD0tIZniCRStr82Ng2JzNJLzLnnodW8"
