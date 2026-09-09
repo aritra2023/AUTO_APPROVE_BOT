@@ -103,6 +103,7 @@ known_users = set(state["users"])
 state_save_lock = asyncio.Lock()
 mongo_client: Any = None
 mongo_collection: Any = None
+visit_url_cache: dict[int, Optional[str]] = {}
 
 
 def save_state(snapshot: Optional[str] = None) -> None:
@@ -514,7 +515,24 @@ async def join_request_handler(
 
     remember_user(user_id)
     remember_managed_chat(request.chat)
-    visit_url = await resolve_visit_url(context.bot, request.chat)
+    asyncio.create_task(
+        send_join_welcome(
+            context.bot,
+            request,
+            chat_title,
+            delivery_chat_id,
+        )
+    )
+    asyncio.create_task(persist_state())
+
+
+async def send_join_welcome(
+    bot,
+    request,
+    chat_title: str,
+    delivery_chat_id: int,
+) -> None:
+    visit_url = await resolve_visit_url(bot, request.chat)
     alive_text = small_caps("Tap Button Below To Check I'm Alive Or Not")
     accepted_name = html.escape(small_caps(first_name(request.from_user).title()))
     accepted_chat = html.escape(small_caps(chat_title.title()))
@@ -526,7 +544,7 @@ async def join_request_handler(
         f"<b>☑️ {alive_text}.</b>"
     )
     try:
-        await context.bot.send_message(
+        await bot.send_message(
             delivery_chat_id,
             text,
             parse_mode=ParseMode.HTML,
@@ -537,7 +555,6 @@ async def join_request_handler(
         )
     except TelegramError:
         logger.exception("Could not send welcome message to join-request chat")
-    await persist_state()
 
 
 async def resolve_visit_url(bot, chat) -> Optional[str]:
@@ -545,12 +562,23 @@ async def resolve_visit_url(bot, chat) -> Optional[str]:
     if getattr(chat, "username", None):
         return f"https://t.me/{chat.username}"
 
+    cached_url = visit_url_cache.get(chat.id)
+    if cached_url is not None:
+        return cached_url
+
+    if is_valid_url(CHANNEL_URL):
+        visit_url_cache[chat.id] = CHANNEL_URL
+        return CHANNEL_URL
+
     try:
         full_chat = await bot.get_chat(chat.id)
         if getattr(full_chat, "username", None):
-            return f"https://t.me/{full_chat.username}"
+            visit_url = f"https://t.me/{full_chat.username}"
+            visit_url_cache[chat.id] = visit_url
+            return visit_url
         current_invite = getattr(full_chat, "invite_link", None)
         if is_valid_url(current_invite):
+            visit_url_cache[chat.id] = current_invite
             return current_invite
     except TelegramError:
         logger.exception("Could not fetch current invite link for chat %s", chat.id)
@@ -562,6 +590,7 @@ async def resolve_visit_url(bot, chat) -> Optional[str]:
             creates_join_request=False,
         )
         if is_valid_url(invite.invite_link):
+            visit_url_cache[chat.id] = invite.invite_link
             return invite.invite_link
     except TelegramError:
         logger.exception("Could not create a fresh invite link for chat %s", chat.id)
@@ -636,7 +665,8 @@ async def main() -> None:
 
     await application.start()
     await application.updater.start_polling(
-        allowed_updates=["message", "callback_query", "chat_join_request", "my_chat_member"]
+        allowed_updates=["message", "callback_query", "chat_join_request", "my_chat_member"],
+        drop_pending_updates=True,
     )
     runner = await start_health_server()
     logger.info("@%s is ready.", bot_username)
