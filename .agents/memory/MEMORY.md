@@ -1,2 +1,0 @@
-- [Telegram message typography](telegram-message-typography.md) — Telegram clients control bot message fonts; match formatting and layout, not arbitrary font files.
-- [Python Telegram dependencies](python-telegram-bot-dependency.md) — Never install the separate `telegram` package alongside `python-telegram-bot`.

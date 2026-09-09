@@ -1,9 +1,11 @@
 # Oracle Cloud Deployment
 
-This bot uses Telegram long polling, so Oracle does not need a public webhook
-port or a domain. Allow outbound HTTPS and keep only SSH (`TCP 22`) open in
-the OCI security list. The health port is local-only unless you intentionally
-open it.
+This is a lean Python-only repository. Oracle runs only `bot.py`; there is no
+Node.js, pnpm, frontend, API server, or public webhook to configure.
+
+The bot uses Telegram long polling, so Oracle needs outbound HTTPS only. Keep
+only SSH (`TCP 22`) open in the OCI security list. The health port is local-only
+unless you intentionally open it.
 
 ## 1. Create the Oracle VM
 
@@ -40,11 +42,11 @@ sudo chown -R "$USER":"$(id -gn)" /opt/auto-join-bot
 
 ## 4. Upload the project
 
-For a Git repository:
+For a Git repository, use a shallow clone so old Git history is not downloaded:
 
 ```bash
 cd /opt
-git clone YOUR_REPOSITORY_URL auto-join-bot
+git clone --depth 1 --single-branch --branch main YOUR_REPOSITORY_URL auto-join-bot
 cd /opt/auto-join-bot
 ```
 
@@ -73,6 +75,10 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 deactivate
 ```
+
+The requirements file intentionally contains `python-telegram-bot`, not the
+separate PyPI package named `telegram`. Installing both can corrupt the shared
+`telegram` import namespace.
 
 ## 6. Add environment variables
 
@@ -180,15 +186,49 @@ curl http://127.0.0.1:8082/health
 
 ## 10. Updating the bot
 
+Run this after pushing updated code to the repository:
+
 ```bash
 cd /opt/auto-join-bot
-git pull
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-deactivate
+git pull --ff-only origin main
+
+# Keep the existing .env and bot_state.json.
+# Remove both old distributions once, because the conflicting package
+# named "telegram" may have overwritten shared import files.
+.venv/bin/python -m pip uninstall -y telegram python-telegram-bot || true
+.venv/bin/python -m pip install --upgrade --force-reinstall -r requirements.txt
+
 sudo systemctl restart auto-join-bot
+sudo systemctl status auto-join-bot --no-pager
 sudo journalctl -u auto-join-bot -n 50 --no-pager
 ```
 
+If `git pull --ff-only` reports local changes, do not use a destructive reset.
+Inspect them first:
+
+```bash
+git status
+git diff
+```
+
 Back up `bot_state.json` before replacing the VM. It contains local user and
-admin-chat statistics.
+admin-chat statistics. If MongoDB is configured, it is the durable source of
+state after restart.
+
+## Health and troubleshooting
+
+```bash
+curl http://127.0.0.1:8082/health
+sudo systemctl is-active auto-join-bot
+sudo journalctl -u auto-join-bot -n 100 --no-pager
+```
+
+Expected health response:
+
+```json
+{"status": "ok", "bot": "running"}
+```
+
+If Telegram join approval is still slow, set `CHANNEL_URL` in `.env`. This
+avoids private-chat invite-link discovery and lets the welcome message use the
+known URL immediately. Approval itself does not wait for that welcome message.
