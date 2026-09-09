@@ -621,7 +621,7 @@ def create_application() -> Application:
         .get_updates_connection_pool_size(4)
         .pool_timeout(10)
         .connect_timeout(10)
-        .read_timeout(30)
+        .read_timeout(40)
         .write_timeout(30)
         .build()
     )
@@ -665,6 +665,9 @@ async def main() -> None:
 
     await application.start()
     await application.updater.start_polling(
+        poll_interval=0.0,
+        timeout=30,
+        bootstrap_retries=-1,
         allowed_updates=["message", "callback_query", "chat_join_request", "my_chat_member"],
         drop_pending_updates=True,
     )
