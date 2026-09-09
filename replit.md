@@ -1,45 +1,47 @@
-# [Project name]
+# Auto Join Request Acceptor
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+Python Telegram bot that automatically approves channel and group join requests.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+- Run workflow: `PORT=8082 python bot.py`
+- Health check: `GET /health`
+- Required secrets: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_ID`
+- Optional environment: `CHANNEL_URL`, `STATE_FILE`, `MONGO_URL`, `MONGO_DB_NAME`
 
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- Python 3.12
+- `python-telegram-bot`
+- `aiohttp` health endpoint
+- Optional MongoDB persistence via `pymongo`
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `bot.py` — bot handlers, join-request approval, health endpoint, and state management
+- `requirements.txt` — Python dependencies
+- `.replit` — Replit run workflow
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- Local state is used when `MONGO_URL` is not configured.
+- The bot and health endpoint run in one process so the workflow can be monitored by Replit.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+- Automatically approves Telegram channel and group join requests.
+- Provides admin status, stats, and message-casting commands.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+None recorded.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- The bot must be an administrator with permission to approve join requests.
+- Keep Telegram credentials in Replit Secrets; do not place them in `.replit` or source files.
+- MongoDB is recommended for durable state outside the current Replit environment.
 
 ## Pointers
 
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- See `README.md` for admin commands and Oracle deployment notes.

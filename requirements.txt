@@ -1,5 +1,4 @@
 aiohttp>=3.9,<4
 pymongo>=4.9,<5
-pymongo
-telegram
 python-telegram-bot
+telegram
